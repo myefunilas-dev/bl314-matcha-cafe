@@ -1,0 +1,627 @@
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
+import {
+  MenuItem,
+  InventoryItem,
+  Order,
+  LoyaltyCustomer,
+  LoyaltyReward,
+  NotificationEvent,
+  StoreAnalytics,
+  Role,
+  OrderItem,
+  OrderStatus,
+  AppState,
+  WebSocketMessage,
+  StoreTheme
+} from '../types/pos';
+import {
+  INITIAL_MENU,
+  INITIAL_INVENTORY,
+  INITIAL_ORDERS,
+  INITIAL_LOYALTY_CUSTOMERS,
+  INITIAL_NOTIFICATIONS,
+  LOYALTY_REWARDS,
+  computeAnalytics,
+  INITIAL_THEME
+} from '../data/initialData';
+import { playOrderChime, playReadyAlert, playWarningBeep } from '../utils/audio';
+import confetti from 'canvas-confetti';
+
+interface PosContextType {
+  // Data State
+  menu: MenuItem[];
+  inventory: InventoryItem[];
+  orders: Order[];
+  loyaltyCustomers: LoyaltyCustomer[];
+  notifications: NotificationEvent[];
+  analytics: StoreAnalytics | null;
+  rewards: LoyaltyReward[];
+  isWsConnected: boolean;
+  isLoading: boolean;
+
+  // Active User / Role
+  activeRole: Role;
+  setActiveRole: (role: Role) => void;
+  deviceMode: 'responsive' | 'android_frame';
+  setDeviceMode: (mode: 'responsive' | 'android_frame') => void;
+  activeCustomer: LoyaltyCustomer | null;
+  setActiveCustomer: (customer: LoyaltyCustomer | null) => void;
+
+  // Cashier Cart State
+  cashierCart: OrderItem[];
+  addToCashierCart: (item: OrderItem) => void;
+  removeFromCashierCart: (index: number) => void;
+  updateCashierCartQuantity: (index: number, quantity: number) => void;
+  clearCashierCart: () => void;
+  attachedLoyaltyCustomer: LoyaltyCustomer | null;
+  setAttachedLoyaltyCustomer: (customer: LoyaltyCustomer | null) => void;
+
+  // Customer Mobile Cart State
+  customerCart: OrderItem[];
+  addToCustomerCart: (item: OrderItem) => void;
+  removeFromCustomerCart: (index: number) => void;
+  updateCustomerCartQuantity: (index: number, quantity: number) => void;
+  clearCustomerCart: () => void;
+
+  // Real-Time Server Action Handlers
+  submitOrder: (orderPayload: any) => Promise<Order>;
+  updateOrderStatus: (orderId: string, newStatus: OrderStatus) => Promise<void>;
+  adjustInventory: (id: string, amount: number, reason: string) => Promise<void>;
+  importCsvMenu: (csvData: string) => Promise<{ count: number }>;
+  saveMenuItem: (item: MenuItem) => Promise<void>;
+  deleteMenuItem: (id: string) => Promise<void>;
+  lookupOrRegisterLoyalty: (phone: string, name?: string, email?: string) => Promise<LoyaltyCustomer>;
+  redeemLoyaltyReward: (customerId: string, rewardId: string) => Promise<void>;
+  markNotificationRead: (id: string | 'all') => Promise<void>;
+  resetDemoState: () => Promise<void>;
+
+  // Floating Push Notification Alert
+  activePushBanner: NotificationEvent | null;
+  dismissPushBanner: () => void;
+  soundEnabled: boolean;
+  setSoundEnabled: (enabled: boolean) => void;
+
+  // Store Theme Customization
+  theme: StoreTheme;
+  updateTheme: (themeUpdate: Partial<StoreTheme>) => Promise<void>;
+
+  // Matcha AI Concierge Bot
+  isChatOpen: boolean;
+  setIsChatOpen: (open: boolean) => void;
+}
+
+const PosContext = createContext<PosContextType | undefined>(undefined);
+
+export const PosProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [menu, setMenu] = useState<MenuItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('bl314_menu');
+      return saved ? JSON.parse(saved) : INITIAL_MENU;
+    } catch {
+      return INITIAL_MENU;
+    }
+  });
+  const [inventory, setInventory] = useState<InventoryItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('bl314_inventory');
+      return saved ? JSON.parse(saved) : INITIAL_INVENTORY;
+    } catch {
+      return INITIAL_INVENTORY;
+    }
+  });
+  const [orders, setOrders] = useState<Order[]>(() => {
+    try {
+      const saved = localStorage.getItem('bl314_orders');
+      return saved ? JSON.parse(saved) : INITIAL_ORDERS;
+    } catch {
+      return INITIAL_ORDERS;
+    }
+  });
+  const [loyaltyCustomers, setLoyaltyCustomers] = useState<LoyaltyCustomer[]>(() => {
+    try {
+      const saved = localStorage.getItem('bl314_customers');
+      return saved ? JSON.parse(saved) : INITIAL_LOYALTY_CUSTOMERS;
+    } catch {
+      return INITIAL_LOYALTY_CUSTOMERS;
+    }
+  });
+  const [notifications, setNotifications] = useState<NotificationEvent[]>(INITIAL_NOTIFICATIONS);
+  const [analytics, setAnalytics] = useState<StoreAnalytics | null>(() => computeAnalytics(INITIAL_ORDERS, INITIAL_INVENTORY));
+  const [rewards, setRewards] = useState<LoyaltyReward[]>(LOYALTY_REWARDS);
+
+  const [activeRole, setActiveRole] = useState<Role>('cashier');
+  const [deviceMode, setDeviceMode] = useState<'responsive' | 'android_frame'>('responsive');
+  const [activeCustomer, setActiveCustomer] = useState<LoyaltyCustomer | null>(INITIAL_LOYALTY_CUSTOMERS[0] || null);
+  const [attachedLoyaltyCustomer, setAttachedLoyaltyCustomer] = useState<LoyaltyCustomer | null>(null);
+
+  const [cashierCart, setCashierCart] = useState<OrderItem[]>([]);
+  const [customerCart, setCustomerCart] = useState<OrderItem[]>([]);
+
+  const [isWsConnected, setIsWsConnected] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [activePushBanner, setActivePushBanner] = useState<NotificationEvent | null>(null);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+
+  // Store Theme Customization State
+  const [theme, setTheme] = useState<StoreTheme>(() => {
+    try {
+      const saved = localStorage.getItem('bl314_theme');
+      return saved ? JSON.parse(saved) : INITIAL_THEME;
+    } catch {
+      return INITIAL_THEME;
+    }
+  });
+  // Matcha AI Concierge Chatbot State
+  const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<any>(null);
+  const bannerTimeoutRef = useRef<any>(null);
+
+  // Trigger floating push toast
+  const triggerPushBanner = useCallback((notif: NotificationEvent) => {
+    setActivePushBanner(notif);
+    if (bannerTimeoutRef.current) clearTimeout(bannerTimeoutRef.current);
+    bannerTimeoutRef.current = setTimeout(() => {
+      setActivePushBanner(null);
+    }, 6000);
+  }, []);
+
+  const dismissPushBanner = useCallback(() => {
+    setActivePushBanner(null);
+    if (bannerTimeoutRef.current) clearTimeout(bannerTimeoutRef.current);
+  }, []);
+
+  // Fetch initial state via REST
+  const fetchInitialState = useCallback(async () => {
+    try {
+      const res = await fetch('/api/state');
+      if (res.ok) {
+        const data: AppState = await res.json();
+        setMenu(data.menu || []);
+        setInventory(data.inventory || []);
+        setOrders(data.orders || []);
+        setLoyaltyCustomers(data.loyaltyCustomers || []);
+        setNotifications(data.notifications || []);
+        setAnalytics(data.analytics || null);
+        setRewards(data.rewards || []);
+        if (data.theme) {
+          setTheme(data.theme);
+        }
+        if (!activeCustomer && data.loyaltyCustomers && data.loyaltyCustomers.length > 0) {
+          setActiveCustomer(data.loyaltyCustomers[0]);
+        }
+      }
+    } catch (err) {
+      console.warn('Initial state fetch error, relying on WebSocket / retries:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [activeCustomer]);
+
+  // Connect WebSocket for live sync
+  const connectWebSocket = useCallback(() => {
+    if (typeof window === 'undefined') return;
+
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}`;
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        setIsWsConnected(true);
+        console.log('BL314 WebSocket connected.');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg: WebSocketMessage = JSON.parse(event.data);
+          handleWebSocketMessage(msg);
+        } catch (e) {
+          console.error('Failed to parse WS message:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        setIsWsConnected(false);
+        // Attempt reconnection after 3 seconds
+        reconnectTimeoutRef.current = setTimeout(() => {
+          connectWebSocket();
+        }, 3000);
+      };
+
+      ws.onerror = (err) => {
+        console.warn('WS error occurred:', err);
+        ws.close();
+      };
+
+      wsRef.current = ws;
+    } catch (e) {
+      console.error('WS initialization failed:', e);
+    }
+  }, []);
+
+  const handleWebSocketMessage = (msg: WebSocketMessage) => {
+    switch (msg.type) {
+      case 'STATE_INIT':
+        setMenu(msg.data.menu);
+        setInventory(msg.data.inventory);
+        setOrders(msg.data.orders);
+        setLoyaltyCustomers(msg.data.loyaltyCustomers);
+        setNotifications(msg.data.notifications);
+        setAnalytics(msg.data.analytics);
+        setRewards(msg.data.rewards);
+        if (msg.data.theme) {
+          setTheme(msg.data.theme);
+        }
+        setIsLoading(false);
+        break;
+
+      case 'ORDER_CREATED':
+        setOrders((prev) => {
+          const exists = prev.some((o) => o.id === msg.data.id);
+          return exists ? prev : [msg.data, ...prev];
+        });
+        if (msg.inventoryUpdates && msg.inventoryUpdates.length > 0) {
+          setInventory((prev) => {
+            const map = new Map(prev.map((i) => [i.id, i]));
+            msg.inventoryUpdates.forEach((up) => map.set(up.id, up));
+            return Array.from(map.values());
+          });
+        }
+        if (msg.notification) {
+          setNotifications((prev) => [msg.notification, ...prev]);
+          triggerPushBanner(msg.notification);
+          if (soundEnabled) playOrderChime();
+        }
+        if (msg.analytics) {
+          setAnalytics(msg.analytics);
+        }
+        break;
+
+      case 'ORDER_STATUS_CHANGED':
+        setOrders((prev) => prev.map((o) => (o.id === msg.data.id ? msg.data : o)));
+        if (msg.notification) {
+          setNotifications((prev) => [msg.notification, ...prev]);
+          triggerPushBanner(msg.notification);
+          if (soundEnabled) {
+            if (msg.data.status === 'ready') {
+              playReadyAlert();
+              confetti({ particleCount: 35, spread: 60, origin: { y: 0.15 } });
+            } else {
+              playOrderChime();
+            }
+          }
+        }
+        break;
+
+      case 'INVENTORY_UPDATED':
+        setInventory((prev) => prev.map((i) => (i.id === msg.data.id ? msg.data : i)));
+        if (msg.notification) {
+          const notif = msg.notification;
+          setNotifications((prev) => [notif, ...prev]);
+          triggerPushBanner(notif);
+          if (soundEnabled && notif.type === 'low_stock') {
+            playWarningBeep();
+          }
+        }
+        if (msg.analytics) {
+          setAnalytics(msg.analytics);
+        }
+        break;
+
+      case 'MENU_UPDATED':
+        setMenu(msg.data);
+        break;
+
+      case 'LOYALTY_UPDATED':
+        setLoyaltyCustomers((prev) => {
+          const idx = prev.findIndex((c) => c.id === msg.data.id);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = msg.data;
+            return next;
+          }
+          return [...prev, msg.data];
+        });
+        if (activeCustomer && activeCustomer.id === msg.data.id) {
+          setActiveCustomer(msg.data);
+        }
+        if (attachedLoyaltyCustomer && attachedLoyaltyCustomer.id === msg.data.id) {
+          setAttachedLoyaltyCustomer(msg.data);
+        }
+        if (msg.notification) {
+          const notif = msg.notification;
+          setNotifications((prev) => [notif, ...prev]);
+          triggerPushBanner(notif);
+        }
+        break;
+
+      case 'NOTIFICATION_RECEIVED':
+        setNotifications((prev) => [msg.data, ...prev]);
+        triggerPushBanner(msg.data);
+        break;
+
+      case 'THEME_UPDATED':
+        setTheme(msg.data);
+        break;
+    }
+  };
+
+  useEffect(() => {
+    fetchInitialState();
+    connectWebSocket();
+
+    return () => {
+      if (wsRef.current) wsRef.current.close();
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (bannerTimeoutRef.current) clearTimeout(bannerTimeoutRef.current);
+    };
+  }, [fetchInitialState, connectWebSocket]);
+
+  // Cashier Cart Handlers
+  const addToCashierCart = useCallback((item: OrderItem) => {
+    setCashierCart((prev) => [...prev, item]);
+  }, []);
+
+  const removeFromCashierCart = useCallback((index: number) => {
+    setCashierCart((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const updateCashierCartQuantity = useCallback((index: number, quantity: number) => {
+    setCashierCart((prev) => {
+      if (quantity <= 0) return prev.filter((_, i) => i !== index);
+      const next = [...prev];
+      const item = next[index];
+      const singlePrice = item.itemTotal / item.quantity;
+      next[index] = {
+        ...item,
+        quantity,
+        itemTotal: Math.round(singlePrice * quantity * 100) / 100
+      };
+      return next;
+    });
+  }, []);
+
+  const clearCashierCart = useCallback(() => {
+    setCashierCart([]);
+    setAttachedLoyaltyCustomer(null);
+  }, []);
+
+  // Customer Cart Handlers
+  const addToCustomerCart = useCallback((item: OrderItem) => {
+    setCustomerCart((prev) => [...prev, item]);
+  }, []);
+
+  const removeFromCustomerCart = useCallback((index: number) => {
+    setCustomerCart((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const updateCustomerCartQuantity = useCallback((index: number, quantity: number) => {
+    setCustomerCart((prev) => {
+      if (quantity <= 0) return prev.filter((_, i) => i !== index);
+      const next = [...prev];
+      const item = next[index];
+      const singlePrice = item.itemTotal / item.quantity;
+      next[index] = {
+        ...item,
+        quantity,
+        itemTotal: Math.round(singlePrice * quantity * 100) / 100
+      };
+      return next;
+    });
+  }, []);
+
+  const clearCustomerCart = useCallback(() => {
+    setCustomerCart([]);
+  }, []);
+
+  // API Actions
+  const submitOrder = async (orderPayload: any): Promise<Order> => {
+    const res = await fetch('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(orderPayload)
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to place order');
+    }
+    const data = await res.json();
+    return data.order;
+  };
+
+  const updateOrderStatus = async (orderId: string, newStatus: OrderStatus): Promise<void> => {
+    const res = await fetch(`/api/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus })
+    });
+    if (!res.ok) {
+      throw new Error('Failed to update order status');
+    }
+  };
+
+  const adjustInventory = async (id: string, amount: number, reason: string): Promise<void> => {
+    const res = await fetch('/api/inventory/adjust', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, amount, reason })
+    });
+    if (!res.ok) {
+      throw new Error('Failed to adjust inventory');
+    }
+  };
+
+  const importCsvMenu = async (csvData: string): Promise<{ count: number }> => {
+    const res = await fetch('/api/menu/import-csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csvData })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to import CSV');
+    }
+    return await res.json();
+  };
+
+  const saveMenuItem = async (item: MenuItem): Promise<void> => {
+    const res = await fetch('/api/menu/item', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(item)
+    });
+    if (!res.ok) {
+      throw new Error('Failed to save menu item');
+    }
+  };
+
+  const deleteMenuItem = async (id: string): Promise<void> => {
+    const res = await fetch(`/api/menu/item/${id}`, {
+      method: 'DELETE'
+    });
+    if (!res.ok) {
+      throw new Error('Failed to delete menu item');
+    }
+  };
+
+  const lookupOrRegisterLoyalty = async (phone: string, name?: string, email?: string): Promise<LoyaltyCustomer> => {
+    const res = await fetch('/api/loyalty/register-or-lookup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, name, email })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Customer not found');
+    }
+    const data = await res.json();
+    return data.customer;
+  };
+
+  const redeemLoyaltyReward = async (customerId: string, rewardId: string): Promise<void> => {
+    const res = await fetch('/api/loyalty/redeem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId, rewardId })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to redeem reward');
+    }
+    confetti({ particleCount: 50, spread: 70, origin: { y: 0.25 } });
+  };
+
+  const markNotificationRead = async (id: string | 'all'): Promise<void> => {
+    await fetch('/api/notifications/mark-read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    setNotifications((prev) =>
+      id === 'all' ? prev.map((n) => ({ ...n, read: true })) : prev.map((n) => (n.id === id ? { ...n, read: true } : n))
+    );
+  };
+
+  const resetDemoState = async (): Promise<void> => {
+    const res = await fetch('/api/reset-demo', { method: 'POST' });
+    if (res.ok) {
+      clearCashierCart();
+      clearCustomerCart();
+      triggerPushBanner({
+        id: `reset_${Date.now()}`,
+        type: 'menu_synced',
+        title: 'Demo State Restored',
+        message: 'Menu, inventory recipes, orders and rewards reset to default.',
+        timestamp: new Date().toISOString(),
+        read: false
+      });
+    }
+  };
+
+  const updateTheme = async (themeUpdate: Partial<StoreTheme>): Promise<void> => {
+    const res = await fetch('/api/theme', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(themeUpdate)
+    });
+    if (!res.ok) {
+      throw new Error('Failed to update theme');
+    }
+    const data = await res.json();
+    if (data.theme) {
+      setTheme(data.theme);
+    }
+  };
+
+  // Sync theme to CSS custom properties
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.style.setProperty('--store-primary', theme.primaryColor);
+      document.documentElement.style.setProperty('--store-accent', theme.accentColor);
+    }
+  }, [theme]);
+
+  return (
+    <PosContext.Provider
+      value={{
+        menu,
+        inventory,
+        orders,
+        loyaltyCustomers,
+        notifications,
+        analytics,
+        rewards,
+        isWsConnected,
+        isLoading,
+        activeRole,
+        setActiveRole,
+        deviceMode,
+        setDeviceMode,
+        activeCustomer,
+        setActiveCustomer,
+        cashierCart,
+        addToCashierCart,
+        removeFromCashierCart,
+        updateCashierCartQuantity,
+        clearCashierCart,
+        attachedLoyaltyCustomer,
+        setAttachedLoyaltyCustomer,
+        customerCart,
+        addToCustomerCart,
+        removeFromCustomerCart,
+        updateCustomerCartQuantity,
+        clearCustomerCart,
+        submitOrder,
+        updateOrderStatus,
+        adjustInventory,
+        importCsvMenu,
+        saveMenuItem,
+        deleteMenuItem,
+        lookupOrRegisterLoyalty,
+        redeemLoyaltyReward,
+        markNotificationRead,
+        resetDemoState,
+        activePushBanner,
+        dismissPushBanner,
+        soundEnabled,
+        setSoundEnabled,
+        theme,
+        updateTheme,
+        isChatOpen,
+        setIsChatOpen
+      }}
+    >
+      {children}
+    </PosContext.Provider>
+  );
+};
+
+export const usePos = () => {
+  const context = useContext(PosContext);
+  if (!context) {
+    throw new Error('usePos must be used within a PosProvider');
+  }
+  return context;
+};
